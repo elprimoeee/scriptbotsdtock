@@ -1,125 +1,66 @@
-# ASX Trading Lab
+# Sharadar S&P 500 stock selector
 
-This repository is organised as a compact trading research workspace for ASX experimentation.
+This repository uses Sharadar exclusively. The dataset combines:
 
-It is built around three goals:
+- `SEP` adjusted and unadjusted prices, including delisted securities;
+- point-in-time S&P 500 membership snapshots and changes;
+- `DAILY` valuation data such as P/E, P/B, P/S, EV/EBITDA, and market cap; and
+- filing-date `ART` fundamentals for profitability, financial strength, cash flow,
+  and shareholder yield.
 
-- keep a usable ASX daily dataset up to date
-- make it easy to add new metrics without rewriting the whole pipeline
-- provide a clean place to build and test stock ideas against the ASX200 or another benchmark
+The API key is read from `SHARADAR_API_KEY` in `.env` and is never written to an
+output file.
 
-## Main Structure
-
-- `main.py`
-  - single hardcoded entrypoint for selecting which model to run
-  - toggles the two benchmark test modes with a two-boolean list
-- `scripts/`
-  - day-to-day data and audit scripts
-  - the single dataset-build script plus the dataset integrity audit
-- `models/`
-  - workspace for new models
-  - includes the reference walk-forward metric model
-- `metric_modules/`
-  - optional custom metrics loaded automatically by the dataset builder
-- `docs/`
-  - structure notes
-
-See `docs/architecture.md`.
-
-## Core Commands
-
-Install dependencies:
+## Build the dataset
 
 ```powershell
-pip install -r requirements.txt
+.\.venv\Scripts\python.exe .\scripts\build_sp500_dataset.py --years 10
 ```
 
-Build or refresh the ASX dataset:
+Generated inputs (ignored by Git):
+
+- `data/processed/sp500_daily_dataset.csv`
+- `data/raw/universe/sp500_membership_history.csv`
+- `data/raw/universe/sp500_events.csv`
+- `data/raw/benchmark/sp500_spy_sharadar.csv` — SPY adjusted close from Sharadar,
+  used as the S&P 500 total-return baseline in reports.
+
+Refresh only the benchmark with:
 
 ```powershell
-python scripts/build_asx_dataset.py --verbose
+.\.venv\Scripts\python.exe .\scripts\build_sp500_dataset.py --years 10 --benchmark-only
 ```
 
-Quick sample run:
+## Tune factor weights
 
 ```powershell
-python scripts/build_asx_dataset.py --max-tickers 25 --verbose
+.\.venv\Scripts\python.exe .\scripts\tune_sp500_sharadar_weights.py --samples 10000
 ```
 
-Run the selected model from the root entrypoint:
+The tuner uses overlapping six-month portfolios for better sample coverage,
+selects weights on the older development period, purges portfolios crossing the
+split, and reports the final two years as an untouched audit. Outputs are written
+to `results/sp500_sharadar_weight_tuning/`.
+
+## Run and rank
+
+Run the six-year, top-25, six-month-hold simulation:
 
 ```powershell
-python main.py
+.\.venv\Scripts\python.exe .\scripts\run_sp500_sharadar_backtest.py
 ```
 
-Edit `SELECTED_MODEL` and `SELECTED_TESTS` in `main.py` to change which model runs and whether the direct and hedged-short benchmark tests are generated.
-
-When enabled, outputs are saved under:
-
-- `results/direct/`
-- `results/hedged/`
-
-Each selected mode folder contains the backtest CSV outputs plus a mode-specific benchmark comparison CSV and SVG chart.
-
-- `results/direct/`
-  - stock-only long/short equity strategy results
-  - compared against a plain ASX200 buy-and-hold benchmark
-- `results/hedged/`
-  - stock strategy results with the explicit ASX200 short hedge applied
-
-Generate an autoplay HTML replay from the saved results:
+Rank the latest point-in-time universe:
 
 ```powershell
-python scripts/render_strategy_replay.py --mode direct
+.\.venv\Scripts\python.exe .\scripts\rank_sp500_portfolio.py --top 25
 ```
 
-The replay is saved to `results/<mode>/strategy_replay.html` and shows synced charts for equity, exposures, holdings mix, trades per day, and the live holdings list.
+Add `--trading212-demo` to the ranking command to annotate instruments and demo
+positions. This is read-only and never submits orders.
 
-Run the existing data audit:
+## Tests
 
 ```powershell
-python scripts/data_quality_audit.py
+.\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
-
-## Benchmark Testing Modes
-
-The reusable benchmark-testing helpers live in `models/benchmarking.py`.
-
-- Direct benchmark test
-  - compare the model return stream directly with the ASX200 or another base
-- Hedged short benchmark test
-  - pair the stock idea with an equal-notional short benchmark leg to test pure outperformance
-
-## Trading Cost Assumptions
-
-The reference backtest now uses explicit IG-style ASX CFD assumptions instead of placeholder retail proxies:
-
-- ASX share CFD leverage cap: `5:1`
-- Margin requirement: `20%` of gross notional exposure
-- Share CFD commission: `0.09%` per trade with a `A$7` minimum ticket charge
-- Overnight funding: `4.0%` annualized on gross CFD notional, charged on a `360` day basis
-- Friday funding: `3x` daily funding to cover the weekend
-- Short stock borrow admin charge: `0.5%` annualized on short notional
-- Benchmark hedge leg: modeled as an index CFD with funding but no per-trade commission
-- Extra spread markup/slippage: `0` by default until you add broker-specific fill data
-
-Backtest outputs now also include daily margin requirement and free-equity fields so you can see how much capital the strategy is tying up under CFD rules.
-
-Shared non-model settings now live in `project_config.py`, including fees, benchmark symbols, file paths, output names, and portfolio sizing defaults.
-
-## Reference Code
-
-The existing reference strategy now lives in the models layer:
-
-- `scripts/build_asx_dataset.py`
-- `models/metric.py`
-- `scripts/data_quality_audit.py`
-
-The training-data build is now a single monolith script: `scripts/build_asx_dataset.py`.
-
-## Notes
-
-- By default, rows tagged by ASX as `Not Applic` or `Class Pend` are excluded.
-- Current implemented metric coverage is listed in `docs/metric_coverage.md`.
-- Price-derived metrics are point-in-time safe for the current backtest after signal lagging.
-- Yahoo metadata fields such as shares outstanding, valuation ratios, forward EPS, and dividend snapshot fields are still snapshots, not true historical fundamentals.

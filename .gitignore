@@ -9,6 +9,7 @@ venv/
 .ruff_cache/
 .coverage
 htmlcov/
+.env
 
 # Editor and OS files
 .vscode/
@@ -20,6 +21,8 @@ Thumbs.db
 data/raw/
 data/processed/
 data/logs/
+results/
 
 # Local benchmark/cache databases
 *.db
+data/ig_paper/

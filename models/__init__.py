@@ -1,5 +1,1 @@
-"""Project model implementations and helpers."""
-
-from .base import TradingModel
-
-__all__ = ["TradingModel"]
+"""Six-month selector backtest models."""
