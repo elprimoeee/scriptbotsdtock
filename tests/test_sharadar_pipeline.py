@@ -8,7 +8,12 @@ import pandas as pd
 
 from models.sharadar_client import SharadarClient, SharadarCredentials
 from models.sp500_selector import DEFAULT_SP500_WEIGHTS, SP500SelectorConfig, rank_sp500_stocks
-from scripts.build_sp500_dataset import build_membership, merge_point_in_time_fundamentals, ticker_batches
+from scripts.build_sp500_dataset import (
+    build_membership,
+    date_windows,
+    merge_point_in_time_fundamentals,
+    ticker_batches,
+)
 from scripts.rank_sp500_portfolio import normalized_symbol
 
 
@@ -27,21 +32,39 @@ class _Response:
 
 
 class SharadarPipelineTests(unittest.TestCase):
-    def test_production_weights_include_sharadar_fundamentals_and_sum_to_one(self) -> None:
-        self.assertAlmostEqual(sum(DEFAULT_SP500_WEIGHTS.values()), 1.0)
-        self.assertAlmostEqual(DEFAULT_SP500_WEIGHTS["downside_risk_rank"], 0.048900)
-        self.assertAlmostEqual(DEFAULT_SP500_WEIGHTS["shareholder_yield_rank"], 0.294649)
+    def test_production_weights_include_sharadar_fundamentals(self) -> None:
         for factor in (
             "quality_rank", "value_rank", "financial_strength_rank",
             "earnings_yield_rank", "fcf_yield_rank", "shareholder_yield_rank",
+            "risk_adjusted_momentum_6m_rank",
         ):
             self.assertIn(factor, DEFAULT_SP500_WEIGHTS)
+        self.assertGreater(abs(DEFAULT_SP500_WEIGHTS["quality_rank"]), 0.0)
+        self.assertGreater(abs(DEFAULT_SP500_WEIGHTS["value_rank"]), 0.0)
+        self.assertGreater(abs(DEFAULT_SP500_WEIGHTS["financial_strength_rank"]), 0.0)
+
+    def test_sp500_weights_are_normalized_automatically(self) -> None:
+        weights = {name: value * 100.0 for name, value in DEFAULT_SP500_WEIGHTS.items()}
+        config = SP500SelectorConfig(weights=weights)
+
+        self.assertAlmostEqual(sum(config.normalized_weights.values()), 1.0)
+        default_total = sum(DEFAULT_SP500_WEIGHTS.values())
+        for name, value in DEFAULT_SP500_WEIGHTS.items():
+            self.assertAlmostEqual(
+                config.normalized_weights[name], value / default_total
+            )
 
     def test_ticker_batches_respect_api_character_limit(self) -> None:
         batches = ticker_batches(["AAAA", "BBBB", "CCCC", "DDDD"], max_count=10, max_characters=10)
         self.assertEqual(batches, [["AAAA", "BBBB"], ["CCCC", "DDDD"]])
         self.assertTrue(all(len(",".join(batch)) <= 10 for batch in batches))
         self.assertEqual(len(ticker_batches([f"T{i}" for i in range(35)], max_count=50)[0]), 30)
+
+    def test_date_windows_are_inclusive_and_non_overlapping(self) -> None:
+        self.assertEqual(
+            date_windows("1998-03-31", "2026-08-30", years=20),
+            [("1998-03-31", "2018-03-30"), ("2018-03-31", "2026-08-30")],
+        )
 
     def test_trading212_and_class_share_symbols_normalize_consistently(self) -> None:
         self.assertEqual(normalized_symbol("AAPL_US_EQ"), "AAPL")
@@ -114,6 +137,17 @@ class SharadarPipelineTests(unittest.TestCase):
                     "ps": pe / 3, "ev_ebitda": pe,
                 })
         ranked = rank_sp500_stocks(pd.DataFrame(rows), SP500SelectorConfig(max_volatility_percentile=1.0))
+        scaled_weights = {
+            name: value * 100.0 for name, value in DEFAULT_SP500_WEIGHTS.items()
+        }
+        scaled = rank_sp500_stocks(
+            pd.DataFrame(rows),
+            SP500SelectorConfig(
+                max_volatility_percentile=1.0,
+                weights=scaled_weights,
+            ),
+        )
+        np.testing.assert_allclose(ranked["selection_score"], scaled["selection_score"])
         latest = ranked[ranked["date"] == ranked["date"].max()]
         self.assertEqual(set(latest["ticker"]), {"GOOD", "WEAK"})
         self.assertLess(int(latest.set_index("ticker").loc["GOOD", "selection_rank"]),

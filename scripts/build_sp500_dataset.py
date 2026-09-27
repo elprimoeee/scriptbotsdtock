@@ -26,10 +26,20 @@ ART_FIELDS = (
     "assetturnover", "fcf", "revenueusd", "netinccmnusd", "epsusd", "divyield",
 )
 
+# Sharadar's first complete point-in-time S&P 500 membership snapshot. Earlier
+# rows are change events and cannot independently seed a survivorship-safe
+# universe.
+FULL_HISTORY_START = pd.Timestamp("1998-03-31")
+API_WINDOW_YEARS = 20
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--years", type=int, default=10)
+    parser.add_argument(
+        "--full-history", action="store_true",
+        help="Download all survivorship-safe history from 1998-03-31",
+    )
     parser.add_argument("--end", default=date.today().isoformat(), help="Inclusive YYYY-MM-DD end date")
     parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
@@ -51,8 +61,8 @@ def build_spy_benchmark(client: SharadarClient, start: pd.Timestamp,
                         end: pd.Timestamp) -> pd.DataFrame:
     """Return a total-return S&P 500 proxy sourced from Sharadar SEP."""
 
-    rows = client.table(
-        "funds", fields=PRICE_FIELDS, tickers=["SPY"],
+    rows = _fetch_table_windows(
+        client, "funds", fields=PRICE_FIELDS, tickers=["SPY"],
         start=start.date().isoformat(), end=end.date().isoformat(),
     )
     benchmark = _frame(rows)
@@ -90,16 +100,48 @@ def ticker_batches(tickers: list[str], max_count: int, max_characters: int = 200
     return batches
 
 
+def date_windows(start: str, end: str, *, years: int = API_WINDOW_YEARS) -> list[tuple[str, str]]:
+    """Split an inclusive range so Sharadar does not silently truncate it."""
+
+    if years < 1:
+        raise ValueError("years must be positive")
+    first = pd.Timestamp(start).normalize()
+    last = pd.Timestamp(end).normalize()
+    if first > last:
+        raise ValueError("start must not be after end")
+    windows: list[tuple[str, str]] = []
+    current = first
+    while current <= last:
+        window_end = min(current + pd.DateOffset(years=years) - pd.Timedelta(days=1), last)
+        windows.append((current.date().isoformat(), window_end.date().isoformat()))
+        current = window_end + pd.Timedelta(days=1)
+    return windows
+
+
+def _fetch_table_windows(client: SharadarClient, table: str, *, start: str,
+                         end: str, **params: object) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for window_start, window_end in date_windows(start, end):
+        rows.extend(client.table(table, start=window_start, end=window_end, **params))
+    return rows
+
+
 def _fetch_batches(client: SharadarClient, table: str, tickers: list[str], *,
                    fields: tuple[str, ...], start: str, end: str, batch_size: int,
                    **filters: object) -> pd.DataFrame:
     frames: list[pd.DataFrame] = []
     completed = 0
-    for batch in ticker_batches(tickers, batch_size):
+    batches = ticker_batches(tickers, batch_size)
+    windows = date_windows(start, end)
+    for batch in batches:
         print(f"{table}: {completed + 1}-{completed + len(batch)} of {len(tickers)}")
-        rows = client.table(table, fields=fields, tickers=batch, start=start, end=end, **filters)
-        if rows:
-            frames.append(_frame(rows))
+        for window_start, window_end in windows:
+            rows = client.table(
+                table, fields=fields, tickers=batch,
+                start=window_start, end=window_end, **filters,
+            )
+            if rows:
+                frames.append(_frame(rows))
         completed += len(batch)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=fields)
 
@@ -186,7 +228,9 @@ def main() -> None:
     if args.years < 1 or args.batch_size < 1:
         raise SystemExit("--years and --batch-size must be positive")
     end = pd.Timestamp(args.end).normalize()
-    start = end - pd.DateOffset(years=args.years)
+    start = FULL_HISTORY_START if args.full_history else end - pd.DateOffset(years=args.years)
+    if start > end:
+        raise SystemExit(f"History start {start.date()} is after --end {end.date()}")
     snapshot_start = start - pd.DateOffset(months=6)
     client = SharadarClient(SharadarCredentials.from_env_file(args.env_file))
 
@@ -197,7 +241,10 @@ def main() -> None:
     if args.benchmark_only:
         return
 
-    events = _frame(client.table("sp500", start=snapshot_start.date().isoformat(), end=end.date().isoformat()))
+    events = _frame(_fetch_table_windows(
+        client, "sp500", start=snapshot_start.date().isoformat(),
+        end=end.date().isoformat(),
+    ))
     if events.empty:
         raise SystemExit("Sharadar returned no S&P 500 membership history")
     tickers = sorted(set(events["ticker"].dropna().astype(str).str.upper()))

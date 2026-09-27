@@ -38,7 +38,7 @@ class SharadarClient:
     """Retrieve paginated Sharadar tables without logging credentialed URLs."""
 
     def __init__(self, credentials: SharadarCredentials, *, base_url: str = API_BASE_URL,
-                 timeout_seconds: float = 60.0, page_size: int = 100_000) -> None:
+                 timeout_seconds: float = 60.0, page_size: int = 10_000) -> None:
         if not credentials.api_key:
             raise ValueError("A non-empty Sharadar API key is required")
         if page_size < 1:

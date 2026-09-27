@@ -17,6 +17,26 @@ output file.
 .\.venv\Scripts\python.exe .\scripts\build_sp500_dataset.py --years 10
 ```
 
+Download the complete survivorship-safe history from Sharadar's first full
+S&P 500 membership snapshot (31 March 1998):
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\build_sp500_dataset.py --full-history
+```
+
+For large extracts, download Sharadar's compressed full-table archives instead
+of paginating the query API:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\download_sharadar_bulk.py
+```
+
+Build the merged full-history S&P 500 dataset from those local archives:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\build_sp500_from_bulk.py
+```
+
 Generated inputs (ignored by Git):
 
 - `data/processed/sp500_daily_dataset.csv`
@@ -37,10 +57,12 @@ Refresh only the benchmark with:
 .\.venv\Scripts\python.exe .\scripts\tune_sp500_sharadar_weights.py --samples 10000
 ```
 
-The tuner uses overlapping six-month portfolios for better sample coverage,
-selects weights on the older development period, purges portfolios crossing the
-split, and reports the final two years as an untouched audit. Outputs are written
-to `results/sp500_sharadar_weight_tuning/`.
+The tuner uses overlapping six-month portfolios for better sample coverage and
+optimizes benchmark-relative compounded returns rather than raw return alone.
+It also rewards the lower quartile and outperformance frequency while penalizing
+instability across chronological folds. Portfolios crossing the split are purged,
+and the final two years are reported as an untouched audit. Both optimized and
+baseline eight-year reports are written below the selected output directory.
 
 ## Run and rank
 
@@ -48,6 +70,13 @@ Run the six-year, top-25, six-month-hold simulation:
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\run_sp500_sharadar_backtest.py
+```
+
+The backtest runner defaults to the full-history dataset and matching full SPY
+benchmark. For example, a 28-year run now only needs:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\run_sp500_sharadar_backtest.py --years 28 --output-dir results/sp500_selector_hold_28y_sharadar
 ```
 
 Rank the latest point-in-time universe:

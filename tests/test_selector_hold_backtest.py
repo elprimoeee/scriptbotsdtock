@@ -102,6 +102,38 @@ class SelectorHoldBacktestTests(unittest.TestCase):
         self.assertEqual(forced["ticker"].tolist(), ["AAA"])
         self.assertEqual(result.summary["forced_exit_orders"], 1)
 
+    def test_ranking_can_be_limited_to_rebalance_dates(self) -> None:
+        source = self._dataset()
+        requested_dates: list[pd.Timestamp] = []
+
+        def dated_ranking(
+            frame: pd.DataFrame, *, ranking_dates: list[pd.Timestamp]
+        ) -> pd.DataFrame:
+            requested_dates.extend(ranking_dates)
+            ranked = frame[frame["date"].isin(ranking_dates)].copy()
+            ranked["selection_rank"] = ranked.groupby("date")["ticker"].rank(
+                method="first"
+            ).astype(int)
+            ranked["membership_source"] = "test_point_in_time"
+            return ranked
+
+        with TemporaryDirectory() as directory:
+            result = run_selector_hold_backtest(
+                source,
+                constituents=None,
+                years=2,
+                top_n=2,
+                holding_days=126,
+                initial_capital=20_000.0,
+                output_dir=Path(directory),
+                ranking_function=dated_ranking,
+                rank_rebalance_dates_only=True,
+            )
+
+        sessions = pd.DatetimeIndex(result.daily_equity["date"])
+        expected_dates = set(build_rebalance_dates(sessions, 126)) | {sessions[-1]}
+        self.assertEqual(set(requested_dates), expected_dates)
+
 
 if __name__ == "__main__":
     unittest.main()

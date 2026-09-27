@@ -16,6 +16,7 @@ from project_config import PORTFOLIO
 
 
 TRADING_DAYS_PER_MONTH = 21
+ProgressCallback = Callable[[str, int, int], None]
 
 
 @dataclass
@@ -187,31 +188,64 @@ def run_selector_hold_backtest(
     currency_symbol: str = "$",
     commission_rate: float = 0.0,
     minimum_commission: float = 0.0,
-    ranking_function: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
+    ranking_function: Callable[..., pd.DataFrame] | None = None,
+    rank_rebalance_dates_only: bool = False,
+    progress: ProgressCallback | None = None,
     data_source: str = "local_dataset",
     research_limitation: str | None = None,
 ) -> SelectorHoldResult:
     """Buy selector leaders, hold six months, then fully reselect."""
 
+    if progress is not None:
+        progress("Preparing prices", 0, 1)
     prices = _prepare_prices(dataset)
-    ranked = (
-        ranking_function(prices)
-        if ranking_function is not None
-        else rank_stocks(
+    if progress is not None:
+        progress("Preparing prices", 1, 1)
+
+    latest_date = prices["date"].max()
+    requested_start = latest_date - pd.DateOffset(years=years)
+    sessions = pd.DatetimeIndex(
+        prices.loc[prices["date"] >= requested_start, "date"].unique()
+    ).sort_values()
+    if sessions.empty:
+        raise ValueError("No sessions exist in the requested backtest window")
+    rebalance_dates = set(build_rebalance_dates(sessions, holding_days))
+
+    if progress is not None:
+        progress("Ranking stocks", 0, 1)
+    if ranking_function is None:
+        ranked = rank_stocks(
             prices,
             constituents=constituents,
             allow_market_cap_proxy=allow_market_cap_proxy,
         )
-    )
-    latest_date = prices["date"].max()
-    requested_start = latest_date - pd.DateOffset(years=years)
-    sessions = pd.DatetimeIndex(prices.loc[prices["date"] >= requested_start, "date"].unique()).sort_values()
-    if sessions.empty:
-        raise ValueError("No sessions exist in the requested backtest window")
-    rebalance_dates = set(build_rebalance_dates(sessions, holding_days))
-    price_days = {pd.Timestamp(date): day.set_index("ticker") for date, day in prices.loc[prices["date"].isin(sessions)].groupby("date")}
-    rank_days = {pd.Timestamp(date): day.sort_values("selection_rank") for date, day in ranked.loc[ranked["date"].isin(sessions)].groupby("date")}
+    elif rank_rebalance_dates_only:
+        ranked = ranking_function(
+            prices,
+            ranking_dates=sorted(rebalance_dates | {pd.Timestamp(sessions[-1])}),
+        )
+    else:
+        ranked = ranking_function(prices)
+    if progress is not None:
+        progress("Ranking stocks", 1, 1)
+        progress("Indexing backtest window", 0, 1)
+    simulation_prices = prices.loc[
+        prices["date"].between(sessions[0], sessions[-1]),
+        ["date", "ticker", "execution_open", "mark_close"],
+    ]
+    price_days = {
+        pd.Timestamp(date): day.set_index("ticker")
+        for date, day in simulation_prices.groupby("date", sort=False)
+    }
+    rank_days = {
+        pd.Timestamp(date): day.sort_values("selection_rank")
+        for date, day in ranked.loc[ranked["date"].isin(sessions)].groupby(
+            "date", sort=False
+        )
+    }
     final_price_dates = prices.groupby("ticker")["date"].max().to_dict()
+    if progress is not None:
+        progress("Indexing backtest window", 1, 1)
 
     cash = float(initial_capital)
     positions: dict[str, dict[str, float | int | pd.Timestamp]] = {}
@@ -222,11 +256,18 @@ def run_selector_hold_backtest(
     completed_returns: list[float] = []
     total_fees = 0.0
 
-    for date in sessions:
+    session_count = len(sessions)
+    if progress is not None:
+        progress("Running backtest", 0, session_count)
+    for session_number, date in enumerate(sessions, start=1):
         date = pd.Timestamp(date)
         day = price_days[date]
-        for ticker, row in day.iterrows():
-            last_marks[ticker] = float(row["mark_close"])
+        if positions:
+            held_tickers = list(positions)
+            observed_marks = day["mark_close"].reindex(held_tickers).dropna()
+            last_marks.update(
+                {ticker: float(mark) for ticker, mark in observed_marks.items()}
+            )
 
         if date in rebalance_dates:
             # Full liquidation makes the six-month holding period explicit and auditable.
@@ -264,6 +305,7 @@ def run_selector_hold_backtest(
                 cash -= value + commission
                 total_fees += commission
                 positions[ticker] = {"shares": shares, "entry_cost": value + commission, "entry_date": date}
+                last_marks[ticker] = float(day.loc[ticker, "mark_close"])
                 trade_rows.append({"date": date, "action": "BUY", "ticker": ticker, "shares": shares, "price": fill, "value": value, "commission": commission})
 
             marked_equity = cash + sum(int(position["shares"]) * last_marks.get(ticker, 0.0) for ticker, position in positions.items())
@@ -288,6 +330,8 @@ def run_selector_hold_backtest(
 
         equity = cash + sum(int(position["shares"]) * last_marks.get(ticker, 0.0) for ticker, position in positions.items())
         daily_rows.append({"date": date, "equity": equity, "cash": cash, "positions_count": len(positions)})
+        if progress is not None:
+            progress("Running backtest", session_number, session_count)
 
     daily = pd.DataFrame(daily_rows)
     daily["drawdown_pct"] = (daily["equity"] / daily["equity"].cummax() - 1.0) * 100.0
@@ -360,14 +404,28 @@ def run_selector_hold_backtest(
     if "benchmark_equity" not in daily:
         daily["benchmark_equity"] = np.nan
         daily["benchmark_drawdown_pct"] = np.nan
+    if progress is not None:
+        progress("Writing results", 0, 6)
     output_dir.mkdir(parents=True, exist_ok=True)
     daily.to_csv(output_dir / "daily_equity.csv", index=False)
+    if progress is not None:
+        progress("Writing results", 1, 6)
     trades.to_csv(output_dir / "trades.csv", index=False)
+    if progress is not None:
+        progress("Writing results", 2, 6)
     rebalances.to_csv(output_dir / "rebalances.csv", index=False)
+    if progress is not None:
+        progress("Writing results", 3, 6)
     latest_ranking.to_csv(output_dir / "latest_full_ranking.csv", index=False)
+    if progress is not None:
+        progress("Writing results", 4, 6)
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, default=lambda value: value.item() if isinstance(value, np.generic) else str(value)),
         encoding="utf-8",
     )
+    if progress is not None:
+        progress("Writing results", 5, 6)
     report_path = _write_report(output_dir, summary, daily, trades, rebalances)
+    if progress is not None:
+        progress("Writing results", 6, 6)
     return SelectorHoldResult(summary, daily, trades, rebalances, latest_ranking, report_path)

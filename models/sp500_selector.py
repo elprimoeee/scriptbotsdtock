@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -11,21 +12,24 @@ from models.stock_selector import StockSelectorConfig, prepare_selector_features
 
 
 DEFAULT_SP500_WEIGHTS = {
-    "momentum_12m_ex_1m_rank": 0.027233,
-    "momentum_6m_rank": 0.004208,
-    "momentum_3m_rank": 0.155180,
-    "trend_quality_rank": 0.040071,
-    "downside_risk_rank": 0.048900,
-    "drawdown_rank": 0.005191,
-    "liquidity_rank": 0.181538,
-    "size_rank": 0.026393,
-    "quality_rank": 0.020410,
-    "value_rank": 0.063227,
-    "financial_strength_rank": 0.106469,
-    "earnings_yield_rank": 0.012693,
-    "fcf_yield_rank": 0.013838,
-    "shareholder_yield_rank": 0.294649,
-}
+ "momentum_12m_ex_1m_rank": 25, # ghood
+ "momentum_6m_rank": 55, # really gooid
+ "momentum_3m_rank": 25, # good
+ "trend_quality_rank": 0.0, # Slightly negative
+ "downside_risk_rank": 0, # This was terrible
+ "drawdown_rank": -10, # Slightly negative
+ "liquidity_rank": 10, #good
+ "size_rank": 0, #slightly worse
+ "quality_rank": 5, #good but no consistantly strong
+ "value_rank": 25, #good 
+ "financial_strength_rank": 10, #even
+ "earnings_yield_rank": 0, #slightly worse
+ "fcf_yield_rank": 0, #slightly worse bvut good with financial strength
+ "shareholder_yield_rank": 0, #worse
+}   
+
+
+
 FUNDAMENTAL_COLUMNS = (
     "market_cap", "pe", "pb", "ps", "ev_ebitda", "roe", "roic", "roa",
     "gross_margin", "net_margin", "ebitda_margin", "current_ratio",
@@ -44,15 +48,32 @@ class SP500SelectorConfig:
     weights: dict[str, float] = field(default_factory=lambda: DEFAULT_SP500_WEIGHTS.copy())
 
     def __post_init__(self) -> None:
-        if not np.isclose(sum(self.weights.values()), 1.0):
-            raise ValueError("S&P 500 selector weights must sum to 1.0")
+        if not self.weights:
+            raise ValueError("S&P 500 selector weights cannot be empty")
+        values = np.asarray(list(self.weights.values()), dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError("S&P 500 selector weights must be finite")
+        if np.isclose(values.sum(), 0.0):
+            raise ValueError("S&P 500 selector weights must have a non-zero total")
+
+    @property
+    def normalized_weights(self) -> dict[str, float]:
+        """Return relative weights scaled to a total of one."""
+
+        total = float(sum(self.weights.values()))
+        return {column: weight / total for column, weight in self.weights.items()}
 
 
 def _rank(frame: pd.DataFrame, column: str, higher: bool = True) -> pd.Series:
     return frame.groupby("date")[column].rank(pct=True, method="average", ascending=higher)
 
 
-def rank_sp500_stocks(dataset: pd.DataFrame, config: SP500SelectorConfig | None = None) -> pd.DataFrame:
+def rank_sp500_stocks(
+    dataset: pd.DataFrame,
+    config: SP500SelectorConfig | None = None,
+    *,
+    ranking_dates: Iterable[object] | None = None,
+) -> pd.DataFrame:
     """Rank only members on each date; fundamentals must already be point-in-time."""
 
     if "is_sp500" not in dataset:
@@ -66,19 +87,24 @@ def rank_sp500_stocks(dataset: pd.DataFrame, config: SP500SelectorConfig | None 
         decision_lag_days=config.decision_lag_days,
     )
     frame = prepare_selector_features(dataset, base_config)
-    source = dataset.copy()
-    source["date"] = pd.to_datetime(source["date"], errors="coerce").dt.normalize()
-    source["ticker"] = source["ticker"].astype(str).str.strip().str.upper()
-    available = [column for column in FUNDAMENTAL_COLUMNS if column in source]
-    extras = source[["date", "ticker", "is_sp500", *available]].drop_duplicates(
-        ["date", "ticker"], keep="last"
-    )
-    frame = frame.merge(extras, on=["date", "ticker"], how="left", suffixes=("", "_pit"))
-    for column in available:
-        candidate = f"{column}_pit"
-        if candidate in frame:
-            frame[column] = frame[candidate]
-        frame[f"decision_{column}"] = frame.groupby("ticker", sort=False)[column].shift(config.decision_lag_days)
+    available = [column for column in FUNDAMENTAL_COLUMNS if column in frame]
+    fundamentals_to_lag = [
+        column for column in available if f"decision_{column}" not in frame
+    ]
+    if fundamentals_to_lag:
+        lagged_fundamentals = frame.groupby("ticker", sort=False)[
+            fundamentals_to_lag
+        ].shift(config.decision_lag_days)
+        lagged_fundamentals.columns = [
+            f"decision_{column}" for column in fundamentals_to_lag
+        ]
+        frame = pd.concat([frame, lagged_fundamentals], axis=1)
+
+    if ranking_dates is not None:
+        decision_dates = pd.DatetimeIndex(
+            pd.to_datetime(list(ranking_dates), errors="coerce")
+        ).dropna().normalize()
+        frame = frame[frame["date"].isin(decision_dates)].copy()
 
     membership = frame["is_sp500"]
     if membership.dtype == object:
@@ -102,6 +128,15 @@ def rank_sp500_stocks(dataset: pd.DataFrame, config: SP500SelectorConfig | None 
     ranked["momentum_12m_ex_1m_rank"] = _rank(ranked, "decision_momentum_12m_ex_1m")
     ranked["momentum_6m_rank"] = _rank(ranked, "decision_momentum_6m")
     ranked["momentum_3m_rank"] = _rank(ranked, "decision_momentum_3m")
+    volatility_scale = ranked["decision_volatility_30d"].where(
+        ranked["decision_volatility_30d"] > 0.0
+    ) * np.sqrt(126.0)
+    ranked["risk_adjusted_momentum_6m"] = (
+        ranked["decision_momentum_6m"] / volatility_scale
+    )
+    ranked["risk_adjusted_momentum_6m_rank"] = _rank(
+        ranked, "risk_adjusted_momentum_6m"
+    )
     ranked["trend_quality_rank"] = _rank(ranked, "decision_trend_quality")
     ranked["downside_risk_rank"] = _rank(ranked, "decision_downside_volatility_90d", False)
     ranked["drawdown_rank"] = _rank(ranked, "decision_drawdown_252d")
@@ -157,11 +192,18 @@ def rank_sp500_stocks(dataset: pd.DataFrame, config: SP500SelectorConfig | None 
     else:
         ranked["shareholder_yield_rank"] = 0.5
     ranked["selection_score"] = 100.0 * sum(
-        ranked[column].fillna(0.5) * weight for column, weight in config.weights.items()
+        ranked[column].fillna(0.5) * weight
+        for column, weight in config.normalized_weights.items()
     )
     ranked["selection_rank"] = ranked.groupby("date")["selection_score"].rank(
         ascending=False, method="first"
     ).astype("int64")
-    return ranked.drop(columns=[c for c in ranked if c.startswith("_")]).sort_values(
+    return ranked.drop(
+        columns=[
+            *[c for c in ranked if c.startswith("_")],
+            "risk_adjusted_momentum_6m",
+        ],
+        errors="ignore",
+    ).sort_values(
         ["date", "selection_rank", "ticker"]
     ).reset_index(drop=True)
