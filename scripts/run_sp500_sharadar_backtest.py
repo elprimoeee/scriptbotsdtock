@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the six-month selector on Sharadar's point-in-time S&P 500 universe."""
+"""Run the six-month composite selector on Sharadar's point-in-time S&P 500 universe."""
 
 from __future__ import annotations
 
@@ -16,7 +16,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.selector_hold_backtest import TRADING_DAYS_PER_MONTH, run_selector_hold_backtest
-from models.sp500_selector import FUNDAMENTAL_COLUMNS, rank_sp500_stocks
+from models.sp500_selector import (
+    DEFAULT_MEAN_REVERSION_RSI_THRESHOLD,
+    FUNDAMENTAL_COLUMNS,
+    SP500SelectorConfig,
+    rank_sp500_stocks,
+)
 
 
 class TerminalProgress:
@@ -119,6 +124,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--years", type=int, default=6)
     parser.add_argument("--top", type=int, default=25)
     parser.add_argument("--holding-months", type=int, default=6)
+    parser.add_argument(
+        "--strategy",
+        choices=("rsi_mean_reversion", "composite"),
+        default="composite",
+        help="Default ranks eligible stocks with the composite factor score",
+    )
     parser.add_argument("--initial-capital", type=float, default=20_000.0)
     parser.add_argument("--output-dir", type=Path, default=Path("results/sp500_selector_hold_6y_sharadar"))
     parser.add_argument("--benchmark", type=Path,
@@ -145,6 +156,12 @@ def main() -> None:
     progress = TerminalProgress(enabled=not args.no_progress)
     dataset = read_dataset(args.input, progress)
     benchmark = pd.read_csv(args.benchmark, usecols=["date", "close"])
+    threshold = (
+        DEFAULT_MEAN_REVERSION_RSI_THRESHOLD
+        if args.strategy == "rsi_mean_reversion"
+        else None
+    )
+    selector_config = SP500SelectorConfig(mean_reversion_rsi_threshold=threshold)
     result = run_selector_hold_backtest(
         dataset,
         constituents=None,
@@ -160,14 +177,20 @@ def main() -> None:
         currency_symbol="$",
         commission_rate=0.0,
         minimum_commission=0.0,
-        ranking_function=rank_sp500_stocks,
+        ranking_function=lambda prices, *, ranking_dates=None: rank_sp500_stocks(
+            prices, selector_config, ranking_dates=ranking_dates
+        ),
         rank_rebalance_dates_only=True,
         progress=progress.update,
         data_source="Sharadar SEP + DAILY + ART + historical S&P 500 membership",
         research_limitation=(
             "Historical Sharadar membership, active/delisted prices, and filing-date ART fundamentals are used. "
-            "Weights were tuned on a purged development sample and checked on a held-out two-year audit. "
-            "Final-session exits approximate delisting/acquisition proceeds; taxes, FX, borrow costs, and market impact are excluded."
+            + (
+                "The RSI-40 strategy was selected after exploratory comparisons; the recent comparison period was inspected and is not an untouched holdout. "
+                if threshold is not None else
+                "Composite factor weights were tuned on a purged development sample and checked on a held-out two-year audit. "
+            )
+            + "Signals use the prior close and simulated trades fill at the next open. Final-session exits approximate delisting/acquisition proceeds; taxes, FX, borrow costs, and market impact are excluded."
         ),
     )
     print("Backtest complete")

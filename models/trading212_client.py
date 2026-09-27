@@ -1,13 +1,14 @@
-"""Small, dependency-free client for the Trading 212 practice API.
+"""Small, dependency-free client locked to the Trading 212 demo API.
 
-The client is deliberately locked to the demo host.  Trading 212's market-order
-endpoint is not idempotent, so POST requests are never retried here.
+GET requests may be retried. Order submissions are sent once because the API
+does not make them idempotent.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,7 +58,7 @@ class Trading212Credentials:
 
 
 class Trading212PracticeClient:
-    """Read account state and place orders against Trading 212 demo only."""
+    """Use Trading 212's Invest/Stocks equity demo API; this client is not for CFDs."""
 
     def __init__(
         self,
@@ -78,23 +79,18 @@ class Trading212PracticeClient:
 
     def _request(
         self,
-        method: str,
         path: str,
         *,
-        payload: dict[str, Any] | None = None,
         retry_gets: int = 2,
     ) -> Any:
-        if not path.startswith("/api/"):
-            raise ValueError("Trading 212 API paths must start with /api/")
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        if not path.startswith("/api/v0/equity/"):
+            raise ValueError("Trading 212 API paths must be equity API paths")
         headers = {"Authorization": self._authorization, "Accept": "application/json"}
-        if body is not None:
-            headers["Content-Type"] = "application/json"
 
-        attempts = 1 + (retry_gets if method == "GET" else 0)
+        attempts = 1 + retry_gets
         for attempt in range(attempts):
             request = Request(
-                f"{self.base_url}{path}", data=body, headers=headers, method=method
+                f"{self.base_url}{path}", headers=headers, method="GET"
             )
             try:
                 with urlopen(request, timeout=self.timeout_seconds) as response:
@@ -102,41 +98,86 @@ class Trading212PracticeClient:
                     return json.loads(content) if content else None
             except HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")[:500]
-                if method == "GET" and exc.code in {408, 429, 500, 502, 503, 504} and attempt + 1 < attempts:
+                if exc.code in {408, 500, 502, 503, 504} and attempt + 1 < attempts:
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 raise Trading212Error(f"Trading 212 returned HTTP {exc.code}: {detail}") from None
             except (URLError, TimeoutError) as exc:
-                if method == "GET" and attempt + 1 < attempts:
+                if attempt + 1 < attempts:
                     time.sleep(1.5 * (attempt + 1))
                     continue
                 raise Trading212Error(f"Trading 212 request failed: {exc.reason if isinstance(exc, URLError) else exc}") from None
         raise Trading212Error("Trading 212 request failed")
 
     def account_summary(self) -> dict[str, Any]:
-        return self._request("GET", "/api/v0/equity/account/summary")
+        return self._request("/api/v0/equity/account/summary")
 
     def instruments(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/api/v0/equity/metadata/instruments")
+        return self._request("/api/v0/equity/metadata/instruments")
 
     def positions(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/api/v0/equity/positions")
+        return self._request("/api/v0/equity/positions")
 
     def pending_orders(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/api/v0/equity/orders")
+        return self._request("/api/v0/equity/orders")
 
-    def market_order(
-        self, *, ticker: str, quantity: float, extended_hours: bool = False
-    ) -> dict[str, Any]:
-        if not ticker or quantity == 0:
-            raise ValueError("A ticker and non-zero quantity are required")
-        return self._request(
-            "POST",
-            "/api/v0/equity/orders/market",
-            payload={
-                "ticker": ticker,
-                "quantity": quantity,
-                "extendedHours": extended_hours,
+    def order_by_id(self, order_id: int) -> dict[str, Any]:
+        if isinstance(order_id, bool) or int(order_id) < 1:
+            raise ValueError("order_id must be a positive integer")
+        return self._request(f"/api/v0/equity/orders/{int(order_id)}")
+
+    def market_order(self, *, ticker: str, quantity: float) -> dict[str, Any]:
+        """Submit one demo market order. POST requests are never retried."""
+
+        try:
+            normalized_quantity = float(quantity)
+        except (TypeError, ValueError):
+            raise ValueError("quantity must be a finite, non-zero number") from None
+        if not ticker or not ticker.strip():
+            raise ValueError("ticker is required")
+        if not math.isfinite(normalized_quantity) or normalized_quantity == 0:
+            raise ValueError("quantity must be a finite, non-zero number")
+
+        payload = {
+            "ticker": ticker.strip(),
+            "quantity": normalized_quantity,
+            "extendedHours": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = Request(
+            f"{self.base_url}/api/v0/equity/orders/market",
+            data=body,
+            headers={
+                "Authorization": self._authorization,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
             },
-            retry_gets=0,
+            method="POST",
         )
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                content = response.read()
+                return json.loads(content) if content else None
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            if exc.code >= 500 or exc.code == 408:
+                raise Trading212Error(
+                    f"Trading 212 returned HTTP {exc.code}; the order outcome may be unknown. "
+                    "Check demo order history before retrying manually. "
+                    f"{detail}"
+                ) from None
+            raise Trading212Error(
+                f"Trading 212 returned HTTP {exc.code}: {detail}"
+            ) from None
+        except json.JSONDecodeError:
+            raise Trading212Error(
+                "Trading 212 returned an unreadable order response; the order outcome may be unknown. "
+                "Check demo order history before retrying manually."
+            ) from None
+        except (URLError, TimeoutError) as exc:
+            reason = exc.reason if isinstance(exc, URLError) else exc
+            raise Trading212Error(
+                "Trading 212 demo order request failed; the outcome may be unknown. "
+                "Check demo order history before retrying manually. "
+                f"({reason})"
+            ) from None

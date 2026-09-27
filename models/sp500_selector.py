@@ -15,7 +15,7 @@ DEFAULT_SP500_WEIGHTS = {
  "momentum_12m_ex_1m_rank": 25, # ghood
  "momentum_6m_rank": 55, # really gooid
  "momentum_3m_rank": 25, # good
- "trend_quality_rank": 0.0, # Slightly negative
+ "trend_quality_rank": 0, # Slightly negative
  "downside_risk_rank": 0, # This was terrible
  "drawdown_rank": -10, # Slightly negative
  "liquidity_rank": 10, #good
@@ -29,6 +29,9 @@ DEFAULT_SP500_WEIGHTS = {
 }   
 
 
+
+DEFAULT_MEAN_REVERSION_RSI_THRESHOLD = 40.0
+RSI_PERIOD = 14
 
 FUNDAMENTAL_COLUMNS = (
     "market_cap", "pe", "pb", "ps", "ev_ebitda", "roe", "roic", "roa",
@@ -45,6 +48,7 @@ class SP500SelectorConfig:
     min_price_vs_200d_ma: float = -0.25
     max_volatility_percentile: float = 0.90
     decision_lag_days: int = 1
+    mean_reversion_rsi_threshold: float | None = None
     weights: dict[str, float] = field(default_factory=lambda: DEFAULT_SP500_WEIGHTS.copy())
 
     def __post_init__(self) -> None:
@@ -55,6 +59,13 @@ class SP500SelectorConfig:
             raise ValueError("S&P 500 selector weights must be finite")
         if np.isclose(values.sum(), 0.0):
             raise ValueError("S&P 500 selector weights must have a non-zero total")
+        if self.decision_lag_days < 0:
+            raise ValueError("decision_lag_days cannot be negative")
+        if self.mean_reversion_rsi_threshold is not None and not (
+            np.isfinite(self.mean_reversion_rsi_threshold)
+            and 0.0 <= self.mean_reversion_rsi_threshold <= 100.0
+        ):
+            raise ValueError("mean_reversion_rsi_threshold must be between 0 and 100")
 
     @property
     def normalized_weights(self) -> dict[str, float]:
@@ -87,6 +98,26 @@ def rank_sp500_stocks(
         decision_lag_days=config.decision_lag_days,
     )
     frame = prepare_selector_features(dataset, base_config)
+
+    if config.mean_reversion_rsi_threshold is not None:
+        # Compute RSI from full history before narrowing to ranking dates. The
+        # lag keeps the signal on the prior close, matching next-open execution.
+        delta = frame.groupby("ticker", sort=False)["close"].diff()
+        gains = delta.clip(lower=0.0)
+        losses = -delta.clip(upper=0.0)
+        average_gain = gains.groupby(frame["ticker"], sort=False).transform(
+            lambda values: values.rolling(RSI_PERIOD, min_periods=RSI_PERIOD).mean()
+        )
+        average_loss = losses.groupby(frame["ticker"], sort=False).transform(
+            lambda values: values.rolling(RSI_PERIOD, min_periods=RSI_PERIOD).mean()
+        )
+        relative_strength = average_gain / average_loss.replace(0.0, np.nan)
+        rsi = 100.0 - (100.0 / (1.0 + relative_strength))
+        rsi = rsi.where(average_loss > 0.0, 100.0)
+        rsi = rsi.where(average_gain > 0.0, 0.0)
+        frame["decision_rsi14"] = rsi.groupby(frame["ticker"], sort=False).shift(
+            config.decision_lag_days
+        )
     available = [column for column in FUNDAMENTAL_COLUMNS if column in frame]
     fundamentals_to_lag = [
         column for column in available if f"decision_{column}" not in frame
@@ -198,6 +229,15 @@ def rank_sp500_stocks(
     ranked["selection_rank"] = ranked.groupby("date")["selection_score"].rank(
         ascending=False, method="first"
     ).astype("int64")
+    if config.mean_reversion_rsi_threshold is not None:
+        ranked = ranked.loc[
+            ranked["decision_rsi14"] <= config.mean_reversion_rsi_threshold
+        ].copy()
+        if ranked.empty:
+            return ranked
+        ranked["selection_rank"] = ranked.groupby("date")["selection_score"].rank(
+            ascending=False, method="first"
+        ).astype("int64")
     return ranked.drop(
         columns=[
             *[c for c in ranked if c.startswith("_")],

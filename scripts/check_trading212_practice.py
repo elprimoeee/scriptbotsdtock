@@ -18,18 +18,14 @@ def main() -> None:
     credentials = Trading212Credentials.from_env_file(PROJECT_ROOT / ".env")
     client = Trading212PracticeClient(credentials)
     account = client.account_summary()
-    positions = client.positions()
-    pending = client.pending_orders()
-    instruments = client.instruments()
+    if not isinstance(account, dict):
+        raise SystemExit("Trading 212 demo returned an unexpected account response")
 
     output = {
         "connected": True,
         "environment": "demo",
-        "account": account,
-        "positions_count": len(positions),
-        "pending_orders_count": len(pending),
-        "instrument_count": len(instruments),
-        "aud_instruments": sum(item.get("currencyCode") == "AUD" for item in instruments),
+        "product": "equity_invest_or_isa",
+        "read_only": True,
     }
     print(json.dumps(output, indent=2, sort_keys=True))
 

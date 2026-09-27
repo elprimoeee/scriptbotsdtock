@@ -14,7 +14,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from models.sp500_selector import rank_sp500_stocks
+from models.sp500_selector import (
+    DEFAULT_MEAN_REVERSION_RSI_THRESHOLD,
+    SP500SelectorConfig,
+    rank_sp500_stocks,
+)
 from models.trading212_client import Trading212Credentials, Trading212PracticeClient
 
 
@@ -57,6 +61,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=Path("data/processed/sp500_daily_dataset.csv"))
     parser.add_argument("--output", type=Path, default=Path("results/sp500_latest_ranking.csv"))
     parser.add_argument("--top", type=int, default=25)
+    parser.add_argument(
+        "--strategy",
+        choices=("rsi_mean_reversion", "composite"),
+        default="composite",
+        help="Default ranks eligible stocks with the composite factor score",
+    )
     parser.add_argument("--trading212-demo", action="store_true", help="Read demo instruments and positions; never places orders")
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
     return parser.parse_args()
@@ -69,11 +79,27 @@ def main() -> None:
     if not args.input.exists():
         raise SystemExit(f"Dataset not found: {args.input}. Run scripts/build_sp500_dataset.py first.")
     dataset = pd.read_csv(args.input, low_memory=False)
-    ranking = rank_sp500_stocks(dataset)
+    threshold = (
+        DEFAULT_MEAN_REVERSION_RSI_THRESHOLD
+        if args.strategy == "rsi_mean_reversion"
+        else None
+    )
+    ranking = rank_sp500_stocks(
+        dataset,
+        SP500SelectorConfig(mean_reversion_rsi_threshold=threshold),
+    )
     if ranking.empty:
-        raise SystemExit("No eligible S&P 500 stocks were found")
-    latest_date = ranking["date"].max()
+        raise SystemExit(
+            "No eligible S&P 500 stocks were found"
+            + (" with prior-close RSI at or below 40" if threshold is not None else "")
+        )
+    latest_date = pd.to_datetime(dataset["date"], errors="coerce").dt.normalize().max()
     latest = ranking.loc[ranking["date"] == latest_date].sort_values("selection_rank")
+    if latest.empty:
+        raise SystemExit(
+            f"No eligible stocks matched {args.strategy} for the latest data date "
+            f"({pd.Timestamp(latest_date).date()})"
+        )
     if args.trading212_demo:
         client = Trading212PracticeClient(Trading212Credentials.from_env_file(args.env_file))
         latest = annotate_trading212(latest, client)
@@ -81,6 +107,8 @@ def main() -> None:
     latest.to_csv(args.output, index=False)
     print(f"Saved {len(latest):,} ranked stocks for {pd.Timestamp(latest_date).date()} to {args.output}")
     columns = ["selection_rank", "ticker", "selection_score", "quality_rank", "value_rank"]
+    if "decision_rsi14" in latest:
+        columns.insert(2, "decision_rsi14")
     if args.trading212_demo:
         columns += ["tradable_on_trading212", "held_in_trading212_demo"]
     print(latest.head(args.top)[columns].to_string(index=False))
